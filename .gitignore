@@ -13,6 +13,8 @@ terraform/*_override.tf.json
 *.json
 !helm/**/*.json
 !.claude/settings.json
+# Claude Code: współdzielone reguły (settings.json) są w repo, lokalne nadpisania nie
+.claude/settings.local.json
 *.pem
 *.key
 *.p12
