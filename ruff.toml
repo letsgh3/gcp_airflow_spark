@@ -1,0 +1,12 @@
+# Ruff — lint Pythona (DAG-i Airflow, helper JupyterHub, stress test).
+# Obrazy Airflow i JupyterHub używają Pythona 3.11.
+target-version = "py311"
+line-length = 100
+extend-exclude = ["terraform/.terraform"]
+
+[lint]
+select = ["E", "W", "F", "I", "UP"]
+ignore = ["E501"]
+
+[lint.isort]
+known-third-party = ["airflow", "pyspark"]

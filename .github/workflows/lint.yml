@@ -1,0 +1,130 @@
+name: lint
+
+# Lint i walidacja bez dostępu do GCP ani klastra — workflow nie używa żadnych sekretów.
+# Wywoływany na PR-ach do main oraz jako reusable workflow (np. przed deployem).
+on:
+  pull_request:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lint-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TERRAFORM_VERSION: "1.9.8"
+  TFLINT_VERSION: "v0.53.0"
+  SHELLCHECK_VERSION: "v0.10.0"
+  RUFF_VERSION: "0.6.9"
+  YAMLLINT_VERSION: "1.35.1"
+  HELM_VERSION: "v3.16.2"
+  AIRFLOW_CHART_VERSION: "1.15.0"
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  terraform:
+    name: terraform (fmt, validate, tflint)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive -diff
+
+      - name: terraform init (bez backendu)
+        run: terraform init -backend=false -input=false
+
+      - name: terraform validate
+        run: terraform validate
+
+      - uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: ${{ env.TFLINT_VERSION }}
+
+      - name: tflint init
+        run: tflint --init --config "$GITHUB_WORKSPACE/.tflint.hcl"
+        env:
+          # wbudowany token runnera (nie sekret repo) — tylko limit API przy pobieraniu pluginu
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: tflint
+        run: tflint --config "$GITHUB_WORKSPACE/.tflint.hcl" --format compact
+
+  shell:
+    name: shellcheck (scripts/)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalacja shellcheck ${{ env.SHELLCHECK_VERSION }}
+        run: |
+          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" \
+            | tar -xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/shellcheck-${SHELLCHECK_VERSION}" >> "$GITHUB_PATH"
+
+      - name: bash -n
+        run: for f in scripts/*.sh; do bash -n "$f"; done
+
+      - name: shellcheck
+        run: |
+          shellcheck --version
+          shellcheck --severity=warning --format=gcc scripts/*.sh
+
+  python:
+    name: ruff (dags, notebooks)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Instalacja ruff ${{ env.RUFF_VERSION }}
+        run: pip install "ruff==${RUFF_VERSION}"
+
+      - name: ruff check
+        run: ruff check --output-format=github .
+
+  yaml-helm:
+    name: yamllint + helm template
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Instalacja yamllint ${{ env.YAMLLINT_VERSION }}
+        run: pip install "yamllint==${YAMLLINT_VERSION}"
+
+      - name: yamllint
+        run: yamllint --format github helm/ k8s/ .github/
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: helm template — Airflow green/blue (chart ${{ env.AIRFLOW_CHART_VERSION }})
+        run: |
+          helm repo add apache-airflow https://airflow.apache.org
+          for slot in green blue; do
+            echo "::group::values-${slot}.yaml"
+            helm template "airflow-${slot}" apache-airflow/airflow \
+              --version "${AIRFLOW_CHART_VERSION}" \
+              --namespace airflow \
+              -f "helm/airflow/values-${slot}.yaml" > /dev/null
+            echo "::endgroup::"
+          done
