@@ -17,7 +17,10 @@ resource "google_service_account" "vm_sa" {
 # }
 
 locals {
-  ssh_pub_key = file(pathexpand(var.ssh_pub_key_path))
+  # CI przekazuje treść klucza (TF_VAR_ssh_public_key); lokalnie fallback na plik.
+  ssh_pub_key = trimspace(
+    var.ssh_public_key != "" ? var.ssh_public_key : try(file(pathexpand(var.ssh_pub_key_path)), "")
+  )
   common_metadata = {
     ssh-keys               = "ubuntu:${local.ssh_pub_key}"
     block-project-ssh-keys = "true"
@@ -73,6 +76,13 @@ resource "google_compute_instance" "master" {
     google_storage_bucket.bootstrap,
     google_storage_bucket.dags,
   ]
+
+  lifecycle {
+    precondition {
+      condition     = local.ssh_pub_key != ""
+      error_message = "Brak klucza SSH: ustaw TF_VAR_ssh_public_key (CI: vars.SSH_PUBLIC_KEY) albo plik ssh_pub_key_path."
+    }
+  }
 }
 
 # ── Worker nodes (Spark + Airflow workery) ────────────────────────────────────

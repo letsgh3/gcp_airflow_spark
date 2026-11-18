@@ -110,6 +110,23 @@ ssh ubuntu@<MASTER_IP> tail -n 200 /var/log/master-init.log
 - Nie commituj sekretów: `.env`, `*.tfstate`, kluczy, `*-secret.yaml`. Hasła trafiają do Terraform jako zmienne
   (`-var` / sekrety GitHub Actions), nigdy jako wartości w plikach.
 
+### Wdrożenie: `.github/workflows/deploy.yml`
+
+- Uruchamiany ręcznie (`workflow_dispatch`), tylko z `main` (job `guard`). Inputy `run_apply` i `run_smoke_test`
+  są domyślnie wyłączone — domyślny run to lint (reusable `lint.yml`) + `terraform plan`.
+- `apply` działa w environment `production` z required reviewers — **człowiek zatwierdza każde wdrożenie**.
+- Uwierzytelnienie do GCP: Workload Identity Federation (bez kluczy JSON).
+- Parametry: projekt i hasła jako `TF_VAR_*` (`vars.GCP_PROJECT_ID`, `secrets.*_PASSWORD`), klucz SSH jako
+  `TF_VAR_ssh_public_key` z `vars.SSH_PUBLIC_KEY`. Lokalnie `ssh_public_key` jest puste → fallback na plik
+  `ssh_pub_key_path`; brak obu zatrzymuje plan (`precondition` na masterze).
+- State: `backend "gcs" {}` w `terraform/main.tf`; bucket i prefix tylko przez `-backend-config`
+  (`vars.TF_STATE_BUCKET`, `vars.TF_STATE_PREFIX`, domyślnie `airflow-spark/terraform`).
+  Lokalnie (`deploy.sh`/`destroy.sh`) z `TF_STATE_BUCKET`/`TF_STATE_PREFIX` w `.env`. Lint używa `init -backend=false`.
+- Migracja wcześniejszego lokalnego state (jednorazowo, wykonuje **administrator** przed pierwszym uruchomieniem CI,
+  nie Claude Code): utworzyć bucket z wersjonowaniem, potem
+  `terraform -chdir=terraform init -migrate-state -backend-config="bucket=..." -backend-config="prefix=..."`
+  i sprawdzić `terraform plan` (oczekiwane: brak zmian poza ewentualnym kluczem SSH).
+
 ### Blokada wdrożeń w Claude Code (`.claude/settings.json`)
 
 `permissions.deny` w `.claude/settings.json` (commitowany do repo, wyjątek `!.claude/settings.json`

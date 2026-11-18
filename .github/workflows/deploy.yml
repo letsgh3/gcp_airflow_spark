@@ -1,0 +1,202 @@
+name: deploy
+
+# Ręczne wdrożenie infrastruktury z main. Domyślnie tylko lint + terraform plan.
+# apply wymaga zaznaczenia run_apply ORAZ zatwierdzenia przez człowieka
+# w environment "production" (Settings → Environments → Required reviewers).
+#
+# Wymagana konfiguracja repo (Settings → Secrets and variables → Actions):
+#   vars:    GCP_PROJECT_ID, GCP_WORKLOAD_IDENTITY_PROVIDER, GCP_SERVICE_ACCOUNT,
+#            TF_STATE_BUCKET, TF_STATE_PREFIX (opcjonalnie), SSH_PUBLIC_KEY,
+#            GCP_REGION / GCP_ZONE (opcjonalnie)
+#   secrets: AIRFLOW_ADMIN_PASSWORD, AIRFLOW_ANALYST_PASSWORD, JUPYTERHUB_ADMIN_PASSWORD,
+#            JUPYTERHUB_ANALYST_PASSWORD, GRAFANA_ADMIN_PASSWORD
+on:
+  workflow_dispatch:
+    inputs:
+      run_apply:
+        description: "Wykonaj terraform apply (po zatwierdzeniu w environment production)"
+        type: boolean
+        default: false
+      run_smoke_test:
+        description: "Sprawdź health Airflow / JupyterHub / Grafana po wdrożeniu"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Nigdy dwa wdrożenia naraz i nigdy nie przerywaj trwającego apply.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  TERRAFORM_VERSION: "1.9.8"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+  TF_STATE_PREFIX: ${{ vars.TF_STATE_PREFIX || 'airflow-spark/terraform' }}
+  TF_VAR_project_id: ${{ vars.GCP_PROJECT_ID }}
+  TF_VAR_region: ${{ vars.GCP_REGION || 'europe-west1' }}
+  TF_VAR_zone: ${{ vars.GCP_ZONE || 'europe-west1-b' }}
+  TF_VAR_ssh_public_key: ${{ vars.SSH_PUBLIC_KEY }}
+
+jobs:
+  guard:
+    name: tylko z main
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Sprawdź gałąź
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Wdrożenie jest dozwolone wyłącznie z main (uruchomiono z ${GITHUB_REF})."
+          exit 1
+
+  lint:
+    needs: guard
+    uses: ./.github/workflows/lint.yml
+
+  plan:
+    name: terraform plan
+    needs: lint
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: terraform
+    env:
+      TF_VAR_airflow_admin_password: ${{ secrets.AIRFLOW_ADMIN_PASSWORD }}
+      TF_VAR_airflow_analyst_password: ${{ secrets.AIRFLOW_ANALYST_PASSWORD }}
+      TF_VAR_jupyterhub_admin_password: ${{ secrets.JUPYTERHUB_ADMIN_PASSWORD }}
+      TF_VAR_jupyterhub_analyst_password: ${{ secrets.JUPYTERHUB_ANALYST_PASSWORD }}
+      TF_VAR_grafana_admin_password: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform init (backend GCS)
+        run: |
+          terraform init \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="prefix=${TF_STATE_PREFIX}"
+
+      - name: terraform plan
+        run: |
+          set -o pipefail
+          terraform plan -lock-timeout=5m -no-color -out=tfplan | tee plan.txt
+          {
+            echo "## terraform plan"
+            echo '```'
+            grep -E '^(Plan:|No changes|  # )' plan.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+        # Plan (tfplan) nie jest publikowany jako artefakt — zawiera hasła z metadata VM.
+
+  apply:
+    name: terraform apply (wymaga zatwierdzenia)
+    needs: plan
+    if: ${{ inputs.run_apply }}
+    runs-on: ubuntu-24.04
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: terraform
+    env:
+      TF_VAR_airflow_admin_password: ${{ secrets.AIRFLOW_ADMIN_PASSWORD }}
+      TF_VAR_airflow_analyst_password: ${{ secrets.AIRFLOW_ANALYST_PASSWORD }}
+      TF_VAR_jupyterhub_admin_password: ${{ secrets.JUPYTERHUB_ADMIN_PASSWORD }}
+      TF_VAR_jupyterhub_analyst_password: ${{ secrets.JUPYTERHUB_ANALYST_PASSWORD }}
+      TF_VAR_grafana_admin_password: ${{ secrets.GRAFANA_ADMIN_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform init (backend GCS)
+        run: |
+          terraform init \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="prefix=${TF_STATE_PREFIX}"
+
+      # Ten sam commit co w jobie plan; plan jest liczony ponownie, bo plik planu
+      # z hasłami nie jest przekazywany między jobami.
+      - name: terraform plan
+        run: terraform plan -lock-timeout=5m -no-color -out=tfplan
+
+      - name: terraform apply
+        run: terraform apply -lock-timeout=5m -no-color tfplan
+
+  smoke-test:
+    name: smoke test
+    needs: [plan, apply]
+    # Po udanym apply albo bez apply (test istniejącego środowiska); nie po nieudanym apply.
+    if: ${{ always() && inputs.run_smoke_test && needs.plan.result == 'success' && (needs.apply.result == 'success' || needs.apply.result == 'skipped') }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Odczytaj IP mastera ze state
+        id: tf
+        working-directory: terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="prefix=${TF_STATE_PREFIX}" > /dev/null
+          echo "master_ip=$(terraform output -raw master_external_ip)" >> "$GITHUB_OUTPUT"
+
+      # Nowa VM potrzebuje ~10-12 min na master-init.sh — czekamy do 25 min.
+      - name: Health check (Airflow 30080, JupyterHub 30088, Grafana 30300)
+        env:
+          MASTER_IP: ${{ steps.tf.outputs.master_ip }}
+        run: |
+          check() {
+            local name="$1" url="$2"
+            for i in $(seq 1 50); do
+              if curl -fsS --max-time 10 "$url" > /dev/null; then
+                echo "OK  ${name}: ${url}"
+                return 0
+              fi
+              echo "... ${name} niegotowy (${i}/50)"
+              sleep 30
+            done
+            echo "::error::${name} nie odpowiada: ${url}"
+            return 1
+          }
+          check "Airflow"    "http://${MASTER_IP}:30080/health"
+          check "JupyterHub" "http://${MASTER_IP}:30088/hub/health"
+          check "Grafana"    "http://${MASTER_IP}:30300/api/health"

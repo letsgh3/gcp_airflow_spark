@@ -32,6 +32,7 @@ required_vars=(
   "GRAFANA_ADMIN_PASSWORD"
   "REGION"
   "ZONE"
+  "TF_STATE_BUCKET"
 )
 
 for var in "${required_vars[@]}"; do
@@ -44,7 +45,9 @@ done
 echo "==> Deploy dla projektu: $PROJECT_ID"
 
 cd "$TF_DIR"
-terraform init
+terraform init \
+  -backend-config="bucket=$TF_STATE_BUCKET" \
+  -backend-config="prefix=${TF_STATE_PREFIX:-airflow-spark/terraform}"
 terraform apply \
   -var="project_id=$PROJECT_ID" \
   -var="airflow_admin_password=$AIRFLOW_ADMIN_PASSWORD" \
