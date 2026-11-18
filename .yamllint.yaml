@@ -1,0 +1,6 @@
+# yamllint — values Helm i manifesty k8s. "relaxed": błędy składni/duplikaty kluczy
+# blokują, styl (długość linii, wcięcia) tylko jako ostrzeżenia.
+extends: relaxed
+
+rules:
+  line-length: disable

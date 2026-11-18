@@ -48,31 +48,36 @@ Kluczowe konsekwencje:
 
 ## Polecenia: lint i walidacja (bezpieczne, uruchamiaj lokalnie)
 
+Te same kroki uruchamia `.github/workflows/lint.yml` na każdym PR do `main` (bez sekretów; reusable przez
+`workflow_call`). Wersje narzędzi są przypięte w `env:` workflow — lokalnie używaj tych samych.
+Konfiguracja: `ruff.toml` (py311, reguły E/W/F/I/UP, bez E501), `.tflint.hcl` (preset recommended + plugin Google),
+`.yamllint.yaml` (relaxed, bez limitu długości linii).
+
 ```bash
 # Terraform
 terraform -chdir=terraform fmt -check -recursive -diff
 terraform -chdir=terraform init -backend=false
 terraform -chdir=terraform validate
+(cd terraform && tflint --init --config ../.tflint.hcl && tflint --config ../.tflint.hcl)
 
 # Skrypty bash (w tym skrypty startowe VM)
-shellcheck scripts/*.sh
-bash -n scripts/*.sh
-
-# YAML (values Helm, manifesty k8s)
-yamllint helm/ k8s/
-
-# Helm — render values względem przypiętego chartu (wymaga `helm repo add apache-airflow https://airflow.apache.org`)
-helm template t apache-airflow/airflow --version 1.15.0 -f helm/airflow/values-green.yaml > /dev/null
-helm template t apache-airflow/airflow --version 1.15.0 -f helm/airflow/values-blue.yaml > /dev/null
-
-# Manifesty k8s
-kubeconform -strict -ignore-missing-schemas k8s/
+for f in scripts/*.sh; do bash -n "$f"; done
+shellcheck --severity=warning scripts/*.sh
 
 # Python (DAG-i, notebooks, stress_test.py)
-ruff check dags/ notebooks/ stress_test.py
-ruff format --check dags/ notebooks/ stress_test.py
-python3 -m py_compile dags/*.py
+ruff check .            # ruff check --fix . naprawia m.in. kolejność importów
+
+# YAML (values Helm, manifesty k8s, workflow)
+yamllint helm/ k8s/ .github/
+
+# Helm — render values Airflow względem przypiętego chartu (wersja = master-init.sh / green-blue-switch.sh)
+helm repo add apache-airflow https://airflow.apache.org
+helm template t apache-airflow/airflow --version 1.15.0 -f helm/airflow/values-green.yaml > /dev/null
+helm template t apache-airflow/airflow --version 1.15.0 -f helm/airflow/values-blue.yaml > /dev/null
 ```
+
+Zmieniając wersję chartu Airflow, zaktualizuj ją w trzech miejscach: `master-init.sh`, `green-blue-switch.sh`
+i `AIRFLOW_CHART_VERSION` w `lint.yml`.
 
 Jeśli narzędzie nie jest zainstalowane, napisz to wprost zamiast pomijać krok po cichu.
 
