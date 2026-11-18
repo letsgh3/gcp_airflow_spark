@@ -98,12 +98,36 @@ ssh ubuntu@<MASTER_IP> tail -n 200 /var/log/master-init.log
   `./scripts/deploy.sh`, `./scripts/destroy.sh`, `helm install/upgrade/uninstall`,
   `kubectl apply/patch/delete/scale`, `./scripts/green-blue-switch.sh switch|deploy|rollback`,
   `gcloud compute ... create/delete`, `gsutil cp/rm` do bucketów kursu.
-  `deploy.sh` jest dodatkowo zablokowany w `.claude/settings.json`.
+  Egzekwuje to blokada w `.claude/settings.json` (patrz niżej).
 - Zmiana infrastruktury = zmiana w kodzie → branch → pull request do `main` → lint i review w CI →
   merge → wdrożenie z `main` przez GitHub Actions po zatwierdzeniu przez człowieka (environment z required reviewers).
 - Lokalnie wolno tylko lintować, walidować i czytać stan (sekcje wyżej).
 - Nie commituj sekretów: `.env`, `*.tfstate`, kluczy, `*-secret.yaml`. Hasła trafiają do Terraform jako zmienne
   (`-var` / sekrety GitHub Actions), nigdy jako wartości w plikach.
+
+### Blokada wdrożeń w Claude Code (`.claude/settings.json`)
+
+`permissions.deny` w `.claude/settings.json` (commitowany do repo, wyjątek `!.claude/settings.json`
+w `.gitignore`; `.claude/settings.local.json` pozostaje ignorowany) blokuje:
+
+| Obszar | Zablokowane | Dozwolone (odczyt/walidacja) |
+|--------|-------------|------------------------------|
+| Terraform | `apply`, `destroy`, `import`, `taint`/`untaint`, `force-unlock`, `state rm/mv/push/replace-provider`, `workspace delete` — także z `-chdir=...` | `init`, `fmt`, `validate`, `plan`, `output`, `show`, `state list/show` |
+| gcloud | `create`, `delete`, `update`, `patch`, `deploy`, `start/stop/reset/resize`, `enable/disable`, `add-*`/`remove-*`/`set-*`, `cp/mv/rm/rsync` | `list`, `describe`, `get-*`, `config list` |
+| gsutil | `cp`, `mv`, `rm`, `rsync`, `mb`, `rb`, `setmeta`, `acl`, `iam`, `lifecycle`, `versioning` (także po `-m`) | `ls`, `cat`, `du`, `stat` |
+| kubectl | `apply`, `create`, `delete`, `patch`, `replace`, `scale`, `edit`, `set`, `label`, `annotate`, `rollout`, `cordon/drain/taint`, `exec`, `cp`, `run`, `expose` (także po `-n ns`) | `get`, `describe`, `logs`, `top`, `explain`, `diff` |
+| Helm | `install`, `upgrade`, `uninstall`/`delete`, `rollback` | `list`, `status`, `template`, `lint`, `repo add/update` |
+| Skrypty | `deploy.sh`, `destroy.sh` w każdej formie: `./scripts/...`, `scripts/...`, ścieżka bezwzględna, `bash`/`sh`/`source` | odczyt plików narzędziem Read |
+| green/blue | `green-blue-switch.sh deploy`, `switch`, `rollback` | `green-blue-switch.sh status` |
+| Sekrety | odczyt/edycja `.env` (Read, Edit, `cat .env`, `source .env`, `< .env`) | `.env.example` |
+
+Uwagi:
+
+- Wzorce kończą się `*` bez spacji (np. `terraform apply*`), więc łapią też polecenia bez argumentów końcowych.
+- Claude Code sprawdza każde podpolecenie osobno, więc `cd terraform && terraform apply` też jest blokowane.
+- Odmowa uprawnień oznacza: **nie obchodź blokady** (inny wrapper, `eval`, skrypt tymczasowy) — przygotuj zmianę
+  w kodzie i PR, a wdrożenie wykona GitHub Actions.
+- Zmiana `.claude/settings.json` to zmiana zasad bezpieczeństwa — tylko przez PR z review.
 
 ### Conventional Commits
 
