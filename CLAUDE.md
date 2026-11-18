@@ -1,0 +1,126 @@
+# CLAUDE.md
+
+Ten plik zawiera wskazówki dla Claude Code (claude.ai/code) przy pracy z kodem w tym repozytorium.
+
+## Opis projektu
+
+Infrastruktura kursu Apache Airflow na samodzielnie postawionym Kubernetesie (kubeadm) na VM-kach w GCP.
+Nie jest to GKE ani Cloud Composer: Terraform tworzy goły Compute Engine, a cały klaster i aplikacje
+stawiają skrypty startowe VM-ek.
+
+Przepływ wdrożenia:
+
+1. `terraform/` tworzy VPC, firewall, NAT, buckety GCS, service account, 1 master (`europe-west1-b`, publiczne IP)
+   i 2 workery (`europe-west4-a`, `europe-central2-a`, bez publicznego IP).
+2. `terraform/vms.tf` wstrzykuje `scripts/master-init.sh` / `scripts/worker-join.sh` jako `startup-script`
+   w metadata VM, a parametry (hasła, buckety, lista analityków) jako klucze `tf_*`.
+   Skrypty odczytują je z metadata serwera (`curl $META/tf_...`), nie z `.env`.
+3. `master-init.sh` (~800 linii, log w `/var/log/master-init.log`, kończy się `SETUP ZAKOŃCZONY`):
+   kubeadm init → Calico → local-path-provisioner → PostgreSQL 15 → Helm: Airflow (slot GREEN),
+   JupyterHub, kube-prometheus-stack, Loki, OTel Collector → konta analityk01–16 z rolami RBAC.
+   Token `kubeadm join` trafia do bucketu bootstrap w GCS.
+4. `worker-join.sh` pobiera join command z GCS i dołącza node do klastra.
+
+Kluczowe konsekwencje:
+
+- **Zmiana w `scripts/master-init.sh` lub `scripts/worker-join.sh` zmienia metadata VM** → Terraform
+  zaktualizuje instancje, a skrypt wykona się przy następnym starcie VM. Traktuj te pliki jak infrastrukturę.
+- Wersje chartów Helm są przypięte w dwóch miejscach i muszą być zgodne:
+  `master-init.sh` (`--version`) oraz `scripts/green-blue-switch.sh` (`CHART_VERSION`).
+  Airflow chart `1.15.0` / Airflow `2.9.1`, JupyterHub `3.3.7`, kube-prometheus-stack `61.3.0`,
+  loki-stack `2.10.2`, opentelemetry-collector `0.97.1`.
+- Airflow działa w modelu green-blue: `helm/airflow/values-{green,blue}.yaml` + Service
+  `k8s/airflow/service-active.yaml` (NodePort 30080), którego selector `slot` wskazuje aktywny slot.
+  Przełączanie: `scripts/green-blue-switch.sh`.
+- DAG-i: `dags/` w repo to przykłady; w klastrze DAG-i pochodzą z bucketu
+  `{project}-airflow-spark-dags/dags/{username}/` (izolacja per analityk przez `access_control`).
+
+## Struktura
+
+| Katalog | Zawartość |
+|---------|-----------|
+| `terraform/` | GCP: `main.tf` (provider, API), `network.tf`, `vms.tf`, `gcs.tf`, `variables.tf`, `outputs.tf` |
+| `scripts/` | `deploy.sh`/`destroy.sh` (wrappery Terraform), skrypty startowe VM, `green-blue-switch.sh` |
+| `helm/` | values dla Airflow (green/blue), JupyterHub, monitoringu |
+| `k8s/` | surowe manifesty: Service przełączający, PrometheusRules |
+| `dags/` | przykładowe DAG-i Airflow 2.9 |
+| `notebooks/` | helper integracji JupyterHub ↔ Airflow |
+
+## Polecenia: lint i walidacja (bezpieczne, uruchamiaj lokalnie)
+
+```bash
+# Terraform
+terraform -chdir=terraform fmt -check -recursive -diff
+terraform -chdir=terraform init -backend=false
+terraform -chdir=terraform validate
+
+# Skrypty bash (w tym skrypty startowe VM)
+shellcheck scripts/*.sh
+bash -n scripts/*.sh
+
+# YAML (values Helm, manifesty k8s)
+yamllint helm/ k8s/
+
+# Helm — render values względem przypiętego chartu (wymaga `helm repo add apache-airflow https://airflow.apache.org`)
+helm template t apache-airflow/airflow --version 1.15.0 -f helm/airflow/values-green.yaml > /dev/null
+helm template t apache-airflow/airflow --version 1.15.0 -f helm/airflow/values-blue.yaml > /dev/null
+
+# Manifesty k8s
+kubeconform -strict -ignore-missing-schemas k8s/
+
+# Python (DAG-i, notebooks, stress_test.py)
+ruff check dags/ notebooks/ stress_test.py
+ruff format --check dags/ notebooks/ stress_test.py
+python3 -m py_compile dags/*.py
+```
+
+Jeśli narzędzie nie jest zainstalowane, napisz to wprost zamiast pomijać krok po cichu.
+
+## Polecenia: odczyt stanu (tylko read-only)
+
+```bash
+terraform -chdir=terraform plan -var="project_id=$PROJECT_ID"   # tylko podgląd, nigdy apply
+terraform -chdir=terraform output
+./scripts/green-blue-switch.sh status                           # aktywny slot, wersje, gotowość
+kubectl get nodes -o wide
+kubectl get pods -A
+kubectl get svc airflow-active -n airflow -o jsonpath='{.spec.selector.slot}'
+helm list -A
+kubectl logs -n airflow -l component=scheduler --tail=100
+ssh ubuntu@<MASTER_IP> tail -n 200 /var/log/master-init.log
+```
+
+## Zasady
+
+### Zmiany infrastruktury wyłącznie przez GitHub Actions
+
+- **Nie uruchamiaj lokalnie** poleceń zmieniających infrastrukturę: `terraform apply`, `terraform destroy`,
+  `./scripts/deploy.sh`, `./scripts/destroy.sh`, `helm install/upgrade/uninstall`,
+  `kubectl apply/patch/delete/scale`, `./scripts/green-blue-switch.sh switch|deploy|rollback`,
+  `gcloud compute ... create/delete`, `gsutil cp/rm` do bucketów kursu.
+  `deploy.sh` jest dodatkowo zablokowany w `.claude/settings.json`.
+- Zmiana infrastruktury = zmiana w kodzie → branch → pull request do `main` → lint i review w CI →
+  merge → wdrożenie z `main` przez GitHub Actions po zatwierdzeniu przez człowieka (environment z required reviewers).
+- Lokalnie wolno tylko lintować, walidować i czytać stan (sekcje wyżej).
+- Nie commituj sekretów: `.env`, `*.tfstate`, kluczy, `*-secret.yaml`. Hasła trafiają do Terraform jako zmienne
+  (`-var` / sekrety GitHub Actions), nigdy jako wartości w plikach.
+
+### Conventional Commits
+
+Wiadomości commitów i tytuły PR-ów w formacie [Conventional Commits](https://www.conventionalcommits.org/):
+
+```
+<typ>(<zakres>): <opis w trybie rozkazującym>
+```
+
+- Typy: `feat`, `fix`, `docs`, `chore`, `refactor`, `ci`, `test`, `perf`, `build`, `revert`.
+- Zakresy dopasowane do repo: `terraform`, `scripts`, `helm`, `k8s`, `dags`, `monitoring`, `ci`, `claude`.
+- Zmiana łamiąca (np. wymagająca odtworzenia VM lub migracji bazy Airflow): `!` po typie/zakresie
+  i stopka `BREAKING CHANGE: ...`.
+- Przykłady: `feat(helm): add blue slot resources`, `fix(scripts): retry kubeadm join on GCS timeout`,
+  `ci: add terraform plan workflow`, `docs(claude): add lint commands to CLAUDE.md`.
+
+### Praca z gałęziami
+
+- Nie commituj bezpośrednio do `main`. Każde zadanie = osobny branch + pull request do `main`.
+- Przed PR uruchom lint dla zmienionych obszarów.
