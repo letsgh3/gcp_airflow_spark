@@ -1,5 +1,10 @@
 terraform {
   required_version = ">= 1.5"
+
+  # State w GCS. Bucket i prefix przekazywane przy init (nie w kodzie):
+  #   terraform init -backend-config="bucket=<TF_STATE_BUCKET>" -backend-config="prefix=<TF_STATE_PREFIX>"
+  backend "gcs" {}
+
   required_providers {
     google = {
       source  = "hashicorp/google"
